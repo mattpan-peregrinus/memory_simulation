@@ -13,7 +13,45 @@ Both pathways run N iterations, save all intermediates, and produce labeled grid
 - CUDA GPU (targeted at Google Colab T4, ~4 GB VRAM)
 - Hugging Face account with access to [runwayml/stable-diffusion-v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5)
 
-## Setup
+## Setup (Google Colab — recommended)
+
+1. Go to [colab.google.com](https://colab.google.com) and create a new notebook
+2. Set runtime to GPU: **Runtime → Change runtime type → T4 GPU**
+3. Accept the Stable Diffusion license at [huggingface.co/runwayml/stable-diffusion-v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5) (click "Agree" — requires a free HuggingFace account)
+4. Run these cells:
+
+```python
+# Cell 1 — Clone repo and install dependencies
+!git clone https://github.com/YOUR_USERNAME/memory_simulation.git
+%cd memory_simulation
+!pip install -r requirements.txt
+```
+
+```python
+# Cell 2 — HuggingFace login (paste your token from huggingface.co/settings/tokens)
+from huggingface_hub import login
+login()
+```
+
+```python
+# Cell 3 — Upload your input photo(s)
+from google.colab import files
+uploaded = files.upload()  # drag and drop your photos
+```
+
+```python
+# Cell 4 — Run generation
+!python compare_pathways.py --input your_photo.jpg --iters 5 --steps 30
+```
+
+```python
+# Cell 5 — Run analysis
+!python analyze_pathways.py --outdir output
+```
+
+Results will be in the `output/` folder — browse via Colab's file panel (left sidebar) or download them.
+
+## Setup (Local)
 
 ```bash
 conda create -n artml-memory python=3.10 -y
