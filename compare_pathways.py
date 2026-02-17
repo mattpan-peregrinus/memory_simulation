@@ -6,6 +6,7 @@ Compares two "memory reconstruction" pathways from a single input photo:
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -182,8 +183,10 @@ def main():
     pipe_img2img, pipe_txt2img, blip_proc, blip_model = load_models(args.model, device)
 
     out = Path(args.outdir)
-    dir_a = out / "pathway_a"
-    dir_b = out / "pathway_b"
+    image_name = Path(args.input).stem
+    image_dir = out / image_name
+    dir_a = image_dir / "pathway_a"
+    dir_b = image_dir / "pathway_b"
 
     print("Running Pathway A (visual recall)...")
     imgs_a = run_pathway_a(img, pipe_img2img, args, dir_a, device)
@@ -194,6 +197,23 @@ def main():
     labels = [f"iter {i}" for i in range(args.iters + 1)]
     make_grid(imgs_a, labels, dir_a / "grid_a.png")
     make_grid(imgs_b, labels, dir_b / "grid_b.png")
+
+    metadata = {
+        "input": str(Path(args.input).resolve()),
+        "image_name": image_name,
+        "width": img.size[0],
+        "height": img.size[1],
+        "iters": args.iters,
+        "prompt": args.prompt,
+        "strength": args.strength,
+        "guidance": args.guidance,
+        "steps": args.steps,
+        "seed": args.seed,
+        "model": args.model,
+    }
+    image_dir.mkdir(parents=True, exist_ok=True)
+    (image_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(f"  Metadata saved: {image_dir / 'metadata.json'}")
 
     print("Done.")
 

@@ -4,3 +4,9 @@ accelerate
 torch
 Pillow
 huggingface_hub
+lpips
+scikit-image
+matplotlib
+numpy
+open-clip-torch
+pandas
