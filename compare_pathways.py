@@ -31,15 +31,18 @@ def parse_args():
 
 
 def authenticate_hf():
-    try:
-        from huggingface_hub import HfFolder
-        token = HfFolder.get_token()
-    except Exception:
-        token = None
+    import os
+    from huggingface_hub import HfFolder
+
+    token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or HfFolder.get_token()
+    )
+
     if not token:
         print("ERROR: No Hugging Face token found.")
-        print("  Run:  huggingface-cli login")
-        print("  Or in Colab:  from huggingface_hub import login; login()")
+        print("Set HF_TOKEN or login first.")
         sys.exit(1)
 
 
