@@ -32,13 +32,18 @@ def parse_args():
 
 def authenticate_hf():
     import os
-    from huggingface_hub import HfFolder
+    try:
+        from huggingface_hub import get_token
+        token = get_token()
+    except ImportError:
+        from huggingface_hub import HfFolder
+        token = HfFolder.get_token()
 
-    token = (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        or HfFolder.get_token()
-    )
+    if not token:
+        token = (
+            os.environ.get("HF_TOKEN")
+            or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        )
 
     if not token:
         print("ERROR: No Hugging Face token found.")
