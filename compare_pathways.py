@@ -1,8 +1,9 @@
-"""Dual-Pathway Memory Reconstruction.
+"""Multi-Pathway Memory Reconstruction.
 
-Compares two "memory reconstruction" pathways from a single input photo:
+Compares memory reconstruction pathways from a single input photo:
   Pathway A (visual recall)    — iterative img2img diffusion
   Pathway B (narrative recall) — iterative image→caption→txt2img generation
+  Pathway C (dream recall)     — ControlNet Canny edge conditioning + BLIP captions
 """
 
 import argparse
@@ -10,14 +11,21 @@ import json
 import sys
 from pathlib import Path
 
+import cv2
+import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
+from diffusers import (
+    ControlNetModel,
+    StableDiffusionControlNetPipeline,
+    StableDiffusionPipeline,
+    StableDiffusionImg2ImgPipeline,
+)
 from transformers import BlipProcessor, BlipForConditionalGeneration
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Dual-pathway memory reconstruction")
+    p = argparse.ArgumentParser(description="Multi-pathway memory reconstruction")
     p.add_argument("--input", required=True, help="Path to input photo")
     p.add_argument("--outdir", default="output", help="Output directory")
     p.add_argument("--iters", type=int, default=5, help="Number of reconstruction iterations")
@@ -27,6 +35,16 @@ def parse_args():
     p.add_argument("--steps", type=int, default=30, help="Inference steps")
     p.add_argument("--seed", type=int, default=42, help="Base random seed")
     p.add_argument("--model", default="runwayml/stable-diffusion-v1-5", help="Stable Diffusion model ID")
+    # Pathway C (dream recall) args
+    p.add_argument("--run-pathway-c", action="store_true", help="Enable Pathway C (dream recall via ControlNet)")
+    p.add_argument("--controlnet-model", default="lllyasviel/sd-controlnet-canny",
+                   help="ControlNet model ID")
+    p.add_argument("--controlnet-scale", type=float, default=1.0,
+                   help="ControlNet conditioning scale")
+    p.add_argument("--canny-low", type=int, default=100, help="Canny edge low threshold")
+    p.add_argument("--canny-high", type=int, default=200, help="Canny edge high threshold")
+    p.add_argument("--dream-structure", choices=["fixed", "drift", "both"], default="both",
+                   help="C-fixed (edges from original), C-drift (edges from current), or both")
     return p.parse_args()
 
 
@@ -60,8 +78,20 @@ def resize_image(img, max_side=768):
     return img.resize((w, h), Image.LANCZOS)
 
 
-def load_models(model_id, device):
-    """Load img2img pipe, derive txt2img from shared components, load BLIP."""
+def extract_canny_edges(pil_img, low, high):
+    """Convert PIL Image to Canny edge map as a 3-channel RGB PIL Image."""
+    gray = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, low, high)
+    edges_rgb = np.stack([edges] * 3, axis=-1)
+    return Image.fromarray(edges_rgb)
+
+
+def load_models(model_id, device, load_controlnet=False, controlnet_model_id=None):
+    """Load img2img pipe, derive txt2img from shared components, load BLIP.
+
+    When load_controlnet=True, also load ControlNet and construct a
+    StableDiffusionControlNetPipeline sharing SD weights.
+    """
     print("Loading Stable Diffusion img2img pipeline...")
     pipe_img2img = StableDiffusionImg2ImgPipeline.from_pretrained(
         model_id,
@@ -82,6 +112,25 @@ def load_models(model_id, device):
         requires_safety_checker=False,
     ).to(device)
 
+    pipe_controlnet = None
+    if load_controlnet:
+        print(f"Loading ControlNet: {controlnet_model_id}...")
+        controlnet = ControlNetModel.from_pretrained(
+            controlnet_model_id, torch_dtype=torch.float16
+        ).to(device)
+        print("Constructing ControlNet pipeline (shared SD weights)...")
+        pipe_controlnet = StableDiffusionControlNetPipeline(
+            vae=pipe_img2img.vae,
+            text_encoder=pipe_img2img.text_encoder,
+            tokenizer=pipe_img2img.tokenizer,
+            unet=pipe_img2img.unet,
+            scheduler=pipe_img2img.scheduler,
+            controlnet=controlnet,
+            safety_checker=None,
+            feature_extractor=None,
+            requires_safety_checker=False,
+        ).to(device)
+
     print("Loading BLIP captioning model...")
     blip_id = "Salesforce/blip-image-captioning-base"
     blip_processor = BlipProcessor.from_pretrained(blip_id)
@@ -89,7 +138,7 @@ def load_models(model_id, device):
         blip_id, torch_dtype=torch.float16
     ).to(device)
 
-    return pipe_img2img, pipe_txt2img, blip_processor, blip_model
+    return pipe_img2img, pipe_txt2img, pipe_controlnet, blip_processor, blip_model
 
 
 def caption_image(img, blip_processor, blip_model, device):
@@ -154,6 +203,53 @@ def run_pathway_b(img, pipe_txt2img, blip_processor, blip_model, args, out_dir, 
     return images
 
 
+def run_pathway_c(img, pipe_controlnet, blip_processor, blip_model, args, out_dir, device, structure_mode):
+    """Pathway C: dream recall via ControlNet Canny edges + BLIP captions.
+
+    structure_mode: 'fixed' — Canny from original every iter
+                    'drift' — Canny from current iter's output
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    current = img.copy()
+    current.save(out_dir / "iter_00.png")
+    images = [current]
+    captions = []
+
+    # Pre-compute original Canny edges
+    original_canny = extract_canny_edges(img, args.canny_low, args.canny_high)
+    original_canny.save(out_dir / "canny_original.png")
+
+    for i in range(1, args.iters + 1):
+        cap = caption_image(current, blip_processor, blip_model, device)
+        captions.append(f"iter_{i:02d}: {cap}")
+        print(f"  Pathway C-{structure_mode}  iter {i}/{args.iters}  caption: {cap}")
+
+        if structure_mode == "fixed":
+            canny_map = original_canny
+        else:
+            canny_map = extract_canny_edges(current, args.canny_low, args.canny_high)
+
+        canny_map.save(out_dir / f"canny_{i:02d}.png")
+
+        gen = torch.Generator(device=device).manual_seed(args.seed + i)
+        result = pipe_controlnet(
+            prompt=cap,
+            image=canny_map,
+            controlnet_conditioning_scale=args.controlnet_scale,
+            guidance_scale=args.guidance,
+            num_inference_steps=args.steps,
+            height=current.size[1],
+            width=current.size[0],
+            generator=gen,
+        ).images[0]
+        result.save(out_dir / f"iter_{i:02d}.png")
+        images.append(result)
+        current = result
+
+    (out_dir / "captions.txt").write_text("\n".join(captions) + "\n")
+    return images
+
+
 def make_grid(images, labels, save_path):
     """Horizontal concatenation of images with labels above each."""
     label_h = 24
@@ -188,7 +284,11 @@ def main():
     img = resize_image(img)
     print(f"Input resized to {img.size[0]}x{img.size[1]}")
 
-    pipe_img2img, pipe_txt2img, blip_proc, blip_model = load_models(args.model, device)
+    pipe_img2img, pipe_txt2img, pipe_controlnet, blip_proc, blip_model = load_models(
+        args.model, device,
+        load_controlnet=args.run_pathway_c,
+        controlnet_model_id=args.controlnet_model,
+    )
 
     out = Path(args.outdir)
     image_name = Path(args.input).stem
@@ -206,6 +306,22 @@ def main():
     make_grid(imgs_a, labels, dir_a / "grid_a.png")
     make_grid(imgs_b, labels, dir_b / "grid_b.png")
 
+    # Pathway C variants
+    if args.run_pathway_c:
+        c_modes = []
+        if args.dream_structure in ("fixed", "both"):
+            c_modes.append("fixed")
+        if args.dream_structure in ("drift", "both"):
+            c_modes.append("drift")
+
+        for mode in c_modes:
+            dir_c = image_dir / f"pathway_c_{mode}"
+            print(f"Running Pathway C-{mode} (dream recall)...")
+            imgs_c = run_pathway_c(
+                img, pipe_controlnet, blip_proc, blip_model, args, dir_c, device, mode
+            )
+            make_grid(imgs_c, labels, dir_c / f"grid_c_{mode}.png")
+
     metadata = {
         "input": str(Path(args.input).resolve()),
         "image_name": image_name,
@@ -219,6 +335,14 @@ def main():
         "seed": args.seed,
         "model": args.model,
     }
+    if args.run_pathway_c:
+        metadata.update({
+            "controlnet_model": args.controlnet_model,
+            "controlnet_scale": args.controlnet_scale,
+            "canny_low": args.canny_low,
+            "canny_high": args.canny_high,
+            "dream_structure": args.dream_structure,
+        })
     image_dir.mkdir(parents=True, exist_ok=True)
     (image_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"  Metadata saved: {image_dir / 'metadata.json'}")

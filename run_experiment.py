@@ -27,6 +27,17 @@ def parse_args():
     p.add_argument("--no-lpips", action="store_true", help="Skip LPIPS in analysis")
     p.add_argument("--no-clip", action="store_true", help="Skip CLIP in analysis")
     p.add_argument("--analysis-device", default="cuda", help="Device for analysis models")
+    # Pathway C args (passed through to compare_pathways.py)
+    p.add_argument("--run-pathway-c", action="store_true",
+                   help="Enable Pathway C (dream recall via ControlNet)")
+    p.add_argument("--controlnet-model", default="lllyasviel/sd-controlnet-canny",
+                   help="ControlNet model ID")
+    p.add_argument("--controlnet-scale", type=float, default=1.0,
+                   help="ControlNet conditioning scale")
+    p.add_argument("--canny-low", type=int, default=100, help="Canny edge low threshold")
+    p.add_argument("--canny-high", type=int, default=200, help="Canny edge high threshold")
+    p.add_argument("--dream-structure", choices=["fixed", "drift", "both"], default="both",
+                   help="C-fixed, C-drift, or both")
     return p.parse_args()
 
 
@@ -58,6 +69,15 @@ def run_generation(input_path, args):
         "--seed", str(args.seed),
         "--model", args.model,
     ]
+    if args.run_pathway_c:
+        cmd += [
+            "--run-pathway-c",
+            "--controlnet-model", args.controlnet_model,
+            "--controlnet-scale", str(args.controlnet_scale),
+            "--canny-low", str(args.canny_low),
+            "--canny-high", str(args.canny_high),
+            "--dream-structure", args.dream_structure,
+        ]
     print(f"\n{'='*60}")
     print(f"Generating: {input_path.name}")
     print(f"{'='*60}")

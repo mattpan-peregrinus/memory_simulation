@@ -123,12 +123,20 @@ def compute_ssim(img_a, img_b):
 # Discovery helpers
 # ---------------------------------------------------------------------------
 
+ALL_PATHWAYS = [
+    ("pathway_a", "A"),
+    ("pathway_b", "B"),
+    ("pathway_c_fixed", "C-fixed"),
+    ("pathway_c_drift", "C-drift"),
+]
+
+
 def discover_images(outdir):
-    """Return list of image subdirectory names that have pathway_a/ and pathway_b/."""
+    """Return list of image subdirectory names that have at least one pathway dir."""
     outdir = Path(outdir)
     names = []
     for d in sorted(outdir.iterdir()):
-        if d.is_dir() and (d / "pathway_a").is_dir() and (d / "pathway_b").is_dir():
+        if d.is_dir() and any((d / pw_dir).is_dir() for pw_dir, _ in ALL_PATHWAYS):
             names.append(d.name)
     return names
 
@@ -175,8 +183,17 @@ def analyze(args):
     # Determine iteration count
     iters = args.iters
     if iters is None:
-        # Auto-detect from first image's pathway_a
-        first_dir = outdir / image_names[0] / "pathway_a"
+        # Auto-detect from first available pathway
+        first_img_dir = outdir / image_names[0]
+        first_dir = None
+        for pw_dir_name, _ in ALL_PATHWAYS:
+            candidate = first_img_dir / pw_dir_name
+            if candidate.is_dir():
+                first_dir = candidate
+                break
+        if first_dir is None:
+            print("ERROR: No pathway directories found.")
+            sys.exit(1)
         iters = len(list(first_dir.glob("iter_*.png"))) - 1
         if iters < 1:
             print("ERROR: Could not auto-detect iteration count.")
@@ -203,14 +220,16 @@ def analyze(args):
         print(f"\nAnalyzing: {img_name}")
         img_dir = outdir / img_name
 
-        for pathway in ("pathway_a", "pathway_b"):
+        for pathway, pw_label in ALL_PATHWAYS:
             pw_dir = img_dir / pathway
-            pw_label = "A" if pathway == "pathway_a" else "B"
+            if not pw_dir.is_dir():
+                continue
             images = load_iteration_images(pw_dir, iters)
             original = images[0]
 
+            has_captions = pathway != "pathway_a"
             captions = {}
-            if pathway == "pathway_b":
+            if has_captions:
                 captions = load_captions(pw_dir)
 
             for i, img in enumerate(images):
@@ -237,7 +256,7 @@ def analyze(args):
                 cap = captions.get(i, "")
                 row["caption"] = cap
 
-                if pathway == "pathway_b" and cap and clip_scorer is not None:
+                if has_captions and cap and clip_scorer is not None:
                     row["clip_text_image_sim"] = clip_scorer.text_image_similarity(cap, img)
                     row["clip_text_orig_sim"] = clip_scorer.text_image_similarity(cap, original)
                 else:
@@ -245,7 +264,7 @@ def analyze(args):
                     row["clip_text_orig_sim"] = None
 
                 # Consecutive caption similarity
-                if pathway == "pathway_b" and i >= 2 and clip_scorer is not None:
+                if has_captions and i >= 2 and clip_scorer is not None:
                     prev_cap = captions.get(i - 1, "")
                     if cap and prev_cap:
                         row["caption_consecutive_sim"] = clip_scorer.text_text_similarity(prev_cap, cap)
@@ -301,7 +320,7 @@ def build_summary(df, iters):
                    "clip_text_image_sim", "clip_text_orig_sim", "caption_consecutive_sim"]
     summary = {"per_iteration": {}, "final_iteration": {}}
 
-    for pathway in ("A", "B"):
+    for pathway in df["pathway"].unique():
         pw_data = df[df["pathway"] == pathway]
         per_iter = {}
         for i in range(iters + 1):
@@ -340,16 +359,17 @@ def plot_degradation_curves(df, iters, analysis_dir):
         ("clip_image_sim", "CLIP Image Similarity", True),
         ("mse", "MSE", True),
         ("psnr", "PSNR (dB)", True),
-        ("clip_text_image_sim", "CLIP Text-Image Sim (B only)", False),
+        ("clip_text_image_sim", "CLIP Text-Image Sim (caption pathways)", False),
     ]
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     axes = axes.flatten()
-    colors = {"A": "#1f77b4", "B": "#ff7f0e"}
+    colors = {"A": "#1f77b4", "B": "#ff7f0e", "C-fixed": "#2ca02c", "C-drift": "#d62728"}
+    all_present = list(df["pathway"].unique())
     iters_range = np.arange(iters + 1)
 
     for ax, (col, title, both_pathways) in zip(axes, metrics):
-        pathways = ["A", "B"] if both_pathways else ["B"]
+        pathways = all_present if both_pathways else [p for p in all_present if p != "A"]
         has_data = False
 
         for pw in pathways:
@@ -373,11 +393,11 @@ def plot_degradation_curves(df, iters, analysis_dir):
                 continue
             has_data = True
 
-            ax.plot(iters_range, means, marker="o", color=colors[pw],
+            ax.plot(iters_range, means, marker="o", color=colors.get(pw, "#9467bd"),
                     label=f"Pathway {pw}", linewidth=2, markersize=5)
             if np.any(stds > 0):
                 ax.fill_between(iters_range, means - stds, means + stds,
-                                alpha=0.2, color=colors[pw])
+                                alpha=0.2, color=colors.get(pw, "#9467bd"))
 
         ax.set_title(title, fontsize=11, fontweight="bold")
         ax.set_xlabel("Iteration")
@@ -387,7 +407,8 @@ def plot_degradation_curves(df, iters, analysis_dir):
             ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
 
-    fig.suptitle("Degradation Curves: Pathway A vs B", fontsize=14, fontweight="bold")
+    pw_str = " vs ".join(all_present)
+    fig.suptitle(f"Degradation Curves: Pathway {pw_str}", fontsize=14, fontweight="bold")
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     save_path = analysis_dir / "degradation_curves.png"
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -396,30 +417,39 @@ def plot_degradation_curves(df, iters, analysis_dir):
 
 
 def plot_comparison_grid(outdir, img_name, iters):
-    """2-row grid (row A, row B) for a single input image."""
+    """N-row grid for a single input image, one row per available pathway."""
     img_dir = Path(outdir) / img_name
+
     rows_imgs = []
-    for pathway in ("pathway_a", "pathway_b"):
-        pw_dir = img_dir / pathway
+    row_labels = []
+    label_map = {"pathway_a": "Pathway A", "pathway_b": "Pathway B",
+                 "pathway_c_fixed": "C-fixed", "pathway_c_drift": "C-drift"}
+    for pw_dir_name, pw_label in ALL_PATHWAYS:
+        pw_dir = img_dir / pw_dir_name
+        if not pw_dir.is_dir():
+            continue
         row = []
         for i in range(iters + 1):
             p = pw_dir / f"iter_{i:02d}.png"
             if p.exists():
                 row.append(Image.open(p).convert("RGB"))
-        rows_imgs.append(row)
+        if row:
+            rows_imgs.append(row)
+            row_labels.append(label_map.get(pw_dir_name, pw_label))
 
-    if not rows_imgs[0] or not rows_imgs[1]:
+    if len(rows_imgs) < 1:
         return
 
     # All images should be same size; use first as reference
     w, h = rows_imgs[0][0].size
     n = len(rows_imgs[0])
+    num_rows = len(rows_imgs)
     label_h = 30
     row_label_w = 80
     padding = 2
 
     total_w = row_label_w + n * w + (n - 1) * padding
-    total_h = label_h + 2 * h + padding
+    total_h = label_h + num_rows * h + (num_rows - 1) * padding
 
     grid = Image.new("RGB", (total_w, total_h), (255, 255, 255))
     draw = ImageDraw.Draw(grid)
@@ -438,7 +468,6 @@ def plot_comparison_grid(outdir, img_name, iters):
         draw.text((x + w // 2 - 20, 4), label, fill=(0, 0, 0), font=small_font)
 
     # Row labels and images
-    row_labels = ["Pathway A", "Pathway B"]
     for r, (row_imgs, rlabel) in enumerate(zip(rows_imgs, row_labels)):
         y = label_h + r * (h + padding)
         draw.text((4, y + h // 2 - 8), rlabel, fill=(0, 0, 0), font=font)
@@ -452,13 +481,14 @@ def plot_comparison_grid(outdir, img_name, iters):
 
 
 def plot_caption_drift(df, iters, analysis_dir):
-    """Plot consecutive caption similarity + caption text table for pathway B."""
-    b_data = df[df["pathway"] == "B"].copy()
-    if b_data.empty:
+    """Plot consecutive caption similarity + caption text table for all caption-producing pathways."""
+    caption_pathways = [p for p in df["pathway"].unique() if p != "A"]
+    cap_data = df[df["pathway"].isin(caption_pathways)].copy()
+    if cap_data.empty:
         return
 
-    has_sim = "caption_consecutive_sim" in b_data.columns and b_data["caption_consecutive_sim"].notna().any()
-    has_captions = b_data["caption"].notna().any() and (b_data["caption"] != "").any()
+    has_sim = "caption_consecutive_sim" in cap_data.columns and cap_data["caption_consecutive_sim"].notna().any()
+    has_captions = cap_data["caption"].notna().any() and (cap_data["caption"] != "").any()
 
     if not has_sim and not has_captions:
         return
@@ -469,23 +499,27 @@ def plot_caption_drift(df, iters, analysis_dir):
         axes = [axes]
     ax_idx = 0
 
+    pw_colors = {"B": "#ff7f0e", "C-fixed": "#2ca02c", "C-drift": "#d62728"}
+
     if has_sim:
         ax = axes[ax_idx]
         ax_idx += 1
-        image_names = b_data["image_name"].unique()
-        colors_cycle = plt.cm.tab10(np.linspace(0, 1, max(len(image_names), 1)))
+        for pw in caption_pathways:
+            pw_data = cap_data[cap_data["pathway"] == pw]
+            image_names = pw_data["image_name"].unique()
+            for img_name in image_names:
+                img_data = pw_data[pw_data["image_name"] == img_name]
+                iters_vals = img_data["iteration"].values
+                sim_vals = img_data["caption_consecutive_sim"].values
+                mask = ~pd.isna(sim_vals)
+                if mask.any():
+                    label = f"{pw} — {img_name}" if len(image_names) > 1 else pw
+                    ax.plot(iters_vals[mask], sim_vals[mask].astype(float),
+                            marker="o", label=label, color=pw_colors.get(pw, "#9467bd"),
+                            linewidth=2, markersize=5)
 
-        for idx, img_name in enumerate(image_names):
-            img_data = b_data[b_data["image_name"] == img_name]
-            iters_vals = img_data["iteration"].values
-            sim_vals = img_data["caption_consecutive_sim"].values
-            mask = ~pd.isna(sim_vals)
-            if mask.any():
-                ax.plot(iters_vals[mask], sim_vals[mask].astype(float),
-                        marker="o", label=img_name, color=colors_cycle[idx % len(colors_cycle)],
-                        linewidth=2, markersize=5)
-
-        ax.set_title("Consecutive Caption Similarity (Pathway B)", fontsize=12, fontweight="bold")
+        pw_str = ", ".join(caption_pathways)
+        ax.set_title(f"Consecutive Caption Similarity ({pw_str})", fontsize=12, fontweight="bold")
         ax.set_xlabel("Iteration")
         ax.set_ylabel("CLIP Text-Text Cosine Sim")
         ax.set_xticks(range(iters + 1))
@@ -498,24 +532,26 @@ def plot_caption_drift(df, iters, analysis_dir):
 
         # Build caption table
         table_data = []
-        image_names = b_data["image_name"].unique()
-        for img_name in image_names:
-            img_data = b_data[b_data["image_name"] == img_name]
-            for _, row in img_data.iterrows():
-                if row["caption"]:
-                    table_data.append([img_name, int(row["iteration"]), row["caption"]])
+        for pw in caption_pathways:
+            pw_data = cap_data[cap_data["pathway"] == pw]
+            for img_name in pw_data["image_name"].unique():
+                img_data = pw_data[pw_data["image_name"] == img_name]
+                for _, row in img_data.iterrows():
+                    if row["caption"]:
+                        table_data.append([pw, img_name, int(row["iteration"]), row["caption"]])
 
         if table_data:
             table = ax.table(
                 cellText=table_data,
-                colLabels=["Image", "Iteration", "Caption"],
+                colLabels=["Pathway", "Image", "Iteration", "Caption"],
                 loc="center",
                 cellLoc="left",
             )
             table.auto_set_font_size(False)
             table.set_fontsize(8)
-            table.auto_set_column_width([0, 1, 2])
-            ax.set_title("Captions per Iteration (Pathway B)", fontsize=12,
+            table.auto_set_column_width([0, 1, 2, 3])
+            pw_str = ", ".join(caption_pathways)
+            ax.set_title(f"Captions per Iteration ({pw_str})", fontsize=12,
                          fontweight="bold", pad=20)
 
     plt.tight_layout()

@@ -9,4 +9,6 @@ scikit-image
 matplotlib
 numpy
 open-clip-torch
+opencv-python
+controlnet-aux
 pandas
