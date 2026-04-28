@@ -128,6 +128,7 @@ ALL_PATHWAYS = [
     ("pathway_b", "B"),
     ("pathway_c_fixed", "C-fixed"),
     ("pathway_c_drift", "C-drift"),
+    ("pathway_d", "D"),
 ]
 
 
@@ -152,17 +153,36 @@ def load_iteration_images(pathway_dir, iters):
     return imgs
 
 
-def load_captions(pathway_b_dir):
-    """Parse captions.txt → dict mapping iteration int → caption string."""
-    cap_file = pathway_b_dir / "captions.txt"
+def load_captions(pathway_dir):
+    """Parse captions.txt → dict mapping iteration int → caption string.
+
+    Strips the [INJECTED] marker used by Pathway D so downstream metrics see
+    the actual prompt text, not the marker.
+    """
+    cap_file = pathway_dir / "captions.txt"
     if not cap_file.exists():
         return {}
     captions = {}
     for line in cap_file.read_text().strip().splitlines():
         m = re.match(r"iter_(\d+):\s*(.*)", line)
         if m:
-            captions[int(m.group(1))] = m.group(2)
+            text = m.group(2)
+            if text.startswith("[INJECTED] "):
+                text = text[len("[INJECTED] "):]
+            captions[int(m.group(1))] = text
     return captions
+
+
+def load_inject_meta(img_dir):
+    """Return (inject_at, inject_probe) from metadata.json, or (None, None)."""
+    meta_path = img_dir / "metadata.json"
+    if not meta_path.exists():
+        return None, None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except json.JSONDecodeError:
+        return None, None
+    return meta.get("inject_at"), meta.get("inject_probe")
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +239,7 @@ def analyze(args):
     for img_name in image_names:
         print(f"\nAnalyzing: {img_name}")
         img_dir = outdir / img_name
+        inject_at, inject_probe = load_inject_meta(img_dir)
 
         for pathway, pw_label in ALL_PATHWAYS:
             pw_dir = img_dir / pathway
@@ -252,7 +273,6 @@ def analyze(args):
                 else:
                     row["clip_image_sim"] = None
 
-                # Caption / semantic metrics (pathway B only)
                 cap = captions.get(i, "")
                 row["caption"] = cap
 
@@ -263,7 +283,6 @@ def analyze(args):
                     row["clip_text_image_sim"] = None
                     row["clip_text_orig_sim"] = None
 
-                # Consecutive caption similarity
                 if has_captions and i >= 2 and clip_scorer is not None:
                     prev_cap = captions.get(i - 1, "")
                     if cap and prev_cap:
@@ -273,10 +292,26 @@ def analyze(args):
                 else:
                     row["caption_consecutive_sim"] = None
 
+                # When the experiment includes a false-memory probe, score every
+                # pathway's image against the probe — Pathway D shows persistence
+                # of the injected concept; the others (B especially) act as
+                # controls that never received the injection.
+                if inject_probe and clip_scorer is not None:
+                    row["clip_probe_sim"] = clip_scorer.text_image_similarity(inject_probe, img)
+                    row["inject_at"] = inject_at
+                    row["inject_probe"] = inject_probe
+                    row["is_injected_iter"] = (pathway == "pathway_d" and i == inject_at)
+                else:
+                    row["clip_probe_sim"] = None
+                    row["inject_at"] = None
+                    row["inject_probe"] = None
+                    row["is_injected_iter"] = False
+
                 rows.append(row)
                 print(f"  {pw_label} iter {i}: MSE={row['mse']:.1f}  SSIM={row['ssim']:.4f}"
                       + (f"  LPIPS={row['lpips']:.4f}" if row['lpips'] is not None else "")
-                      + (f"  CLIP={row['clip_image_sim']:.4f}" if row['clip_image_sim'] is not None else ""))
+                      + (f"  CLIP={row['clip_image_sim']:.4f}" if row['clip_image_sim'] is not None else "")
+                      + (f"  PROBE={row['clip_probe_sim']:.4f}" if row['clip_probe_sim'] is not None else ""))
 
     # Build DataFrame and save CSV
     df = pd.DataFrame(rows)
@@ -293,6 +328,7 @@ def analyze(args):
     # Plots
     plot_degradation_curves(df, iters, analysis_dir)
     plot_caption_drift(df, iters, analysis_dir)
+    plot_false_memory_persistence(df, iters, analysis_dir)
 
     for img_name in image_names:
         plot_comparison_grid(outdir, img_name, iters)
@@ -317,7 +353,8 @@ def _json_default(obj):
 def build_summary(df, iters):
     """Aggregate mean/std per pathway per iteration, plus final-iteration stats."""
     metric_cols = ["mse", "psnr", "ssim", "lpips", "clip_image_sim",
-                   "clip_text_image_sim", "clip_text_orig_sim", "caption_consecutive_sim"]
+                   "clip_text_image_sim", "clip_text_orig_sim", "caption_consecutive_sim",
+                   "clip_probe_sim"]
     summary = {"per_iteration": {}, "final_iteration": {}}
 
     for pathway in df["pathway"].unique():
@@ -364,7 +401,8 @@ def plot_degradation_curves(df, iters, analysis_dir):
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     axes = axes.flatten()
-    colors = {"A": "#1f77b4", "B": "#ff7f0e", "C-fixed": "#2ca02c", "C-drift": "#d62728"}
+    colors = {"A": "#1f77b4", "B": "#ff7f0e", "C-fixed": "#2ca02c",
+              "C-drift": "#d62728", "D": "#9467bd"}
     all_present = list(df["pathway"].unique())
     iters_range = np.arange(iters + 1)
 
@@ -499,7 +537,7 @@ def plot_caption_drift(df, iters, analysis_dir):
         axes = [axes]
     ax_idx = 0
 
-    pw_colors = {"B": "#ff7f0e", "C-fixed": "#2ca02c", "C-drift": "#d62728"}
+    pw_colors = {"B": "#ff7f0e", "C-fixed": "#2ca02c", "C-drift": "#d62728", "D": "#9467bd"}
 
     if has_sim:
         ax = axes[ax_idx]
@@ -559,6 +597,67 @@ def plot_caption_drift(df, iters, analysis_dir):
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Caption drift plot saved: {save_path}")
+
+
+def plot_false_memory_persistence(df, iters, analysis_dir):
+    """Plot CLIP(probe, image) per iteration for Pathway D, with B as control.
+
+    Compares whether the injected concept's similarity stays elevated after the
+    injection iteration (false memory persists) or decays back toward baseline
+    (the system recovers from the lie). Pathway B uses the same probe text but
+    never receives the injection, so it serves as the natural control.
+    """
+    if "clip_probe_sim" not in df.columns:
+        return
+    probe_data = df[df["clip_probe_sim"].notna()]
+    if probe_data.empty or "D" not in probe_data["pathway"].unique():
+        return
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+    iters_range = np.arange(iters + 1)
+    image_names = sorted(probe_data["image_name"].unique())
+    inject_iters = probe_data["inject_at"].dropna().unique()
+
+    style = {"D": ("-", "o"), "B": ("--", "s"), "A": (":", "^"),
+             "C-fixed": ("--", "x"), "C-drift": (":", "+")}
+    color_for_image = ["#9467bd", "#2ca02c", "#1f77b4", "#d62728", "#ff7f0e"]
+
+    for idx, img_name in enumerate(image_names):
+        img_rows = probe_data[probe_data["image_name"] == img_name]
+        probe = img_rows["inject_probe"].dropna().iloc[0]
+        base_color = color_for_image[idx % len(color_for_image)]
+        for pw in ["D", "B"]:
+            pw_rows = img_rows[img_rows["pathway"] == pw].sort_values("iteration")
+            if pw_rows.empty:
+                continue
+            ls, marker = style.get(pw, ("-", "o"))
+            label = (f"{pw} — {img_name}" if len(image_names) > 1 else f"Pathway {pw}")
+            label += f" (probe: \"{probe}\")" if pw == "D" else " [control]"
+            ax.plot(pw_rows["iteration"], pw_rows["clip_probe_sim"].astype(float),
+                    linestyle=ls, marker=marker, linewidth=2, markersize=6,
+                    color=base_color, alpha=1.0 if pw == "D" else 0.55,
+                    label=label)
+
+    if len(inject_iters) == 1:
+        ax.axvline(float(inject_iters[0]), linestyle="--", color="black",
+                   alpha=0.6, label=f"injection @ iter {int(inject_iters[0])}")
+    else:
+        for ij in inject_iters:
+            ax.axvline(float(ij), linestyle="--", color="black", alpha=0.4)
+
+    ax.set_title("False Memory Persistence — CLIP(probe, image) over iterations",
+                 fontsize=12, fontweight="bold")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("CLIP text-image similarity (probe vs. iteration image)")
+    ax.set_xticks(iters_range)
+    ax.legend(fontsize=9, loc="best")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_path = analysis_dir / "false_memory_persistence.png"
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"False memory persistence plot saved: {save_path}")
 
 
 # ---------------------------------------------------------------------------

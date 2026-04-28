@@ -38,7 +38,20 @@ def parse_args():
     p.add_argument("--canny-high", type=int, default=200, help="Canny edge high threshold")
     p.add_argument("--dream-structure", choices=["fixed", "drift", "both"], default="both",
                    help="C-fixed, C-drift, or both")
-    return p.parse_args()
+    # Pathway D args (passed through to compare_pathways.py)
+    p.add_argument("--run-pathway-d", action="store_true",
+                   help="Enable Pathway D (false memory injection)")
+    p.add_argument("--inject-at", type=int, default=3,
+                   help="Iteration at which to inject the false caption (1-indexed)")
+    p.add_argument("--inject-caption", default=None,
+                   help="False caption used at the injection iteration")
+    p.add_argument("--inject-probe", default=None,
+                   help="Short probe text for persistence scoring (defaults to --inject-caption)")
+    args = p.parse_args()
+    if args.run_pathway_d and not args.inject_caption:
+        print("ERROR: --run-pathway-d requires --inject-caption")
+        sys.exit(1)
+    return args
 
 
 def collect_inputs(args):
@@ -78,6 +91,14 @@ def run_generation(input_path, args):
             "--canny-high", str(args.canny_high),
             "--dream-structure", args.dream_structure,
         ]
+    if args.run_pathway_d:
+        cmd += [
+            "--run-pathway-d",
+            "--inject-at", str(args.inject_at),
+            "--inject-caption", args.inject_caption,
+        ]
+        if args.inject_probe is not None:
+            cmd += ["--inject-probe", args.inject_probe]
     print(f"\n{'='*60}")
     print(f"Generating: {input_path.name}")
     print(f"{'='*60}")

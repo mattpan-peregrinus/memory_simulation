@@ -1,9 +1,11 @@
 """Multi-Pathway Memory Reconstruction.
 
 Compares memory reconstruction pathways from a single input photo:
-  Pathway A (visual recall)    — iterative img2img diffusion
-  Pathway B (narrative recall) — iterative image→caption→txt2img generation
-  Pathway C (dream recall)     — ControlNet Canny edge conditioning + BLIP captions
+  Pathway A (visual recall)     — iterative img2img diffusion
+  Pathway B (narrative recall)  — iterative image→caption→txt2img generation
+  Pathway C (dream recall)      — ControlNet Canny edge conditioning + BLIP captions
+  Pathway D (false memory)      — Pathway B with one misleading caption injected
+                                  at iteration k (Loftus-style memory implantation)
 """
 
 import argparse
@@ -45,7 +47,27 @@ def parse_args():
     p.add_argument("--canny-high", type=int, default=200, help="Canny edge high threshold")
     p.add_argument("--dream-structure", choices=["fixed", "drift", "both"], default="both",
                    help="C-fixed (edges from original), C-drift (edges from current), or both")
-    return p.parse_args()
+    # Pathway D (false memory) args
+    p.add_argument("--run-pathway-d", action="store_true",
+                   help="Enable Pathway D (false memory injection)")
+    p.add_argument("--inject-at", type=int, default=3,
+                   help="Iteration at which to inject the false caption (1-indexed)")
+    p.add_argument("--inject-caption", default=None,
+                   help="False caption used at the injection iteration in place of BLIP's caption")
+    p.add_argument("--inject-probe", default=None,
+                   help="Short text probe used to score persistence of the injected concept "
+                        "(defaults to --inject-caption)")
+    args = p.parse_args()
+    if args.run_pathway_d:
+        if not args.inject_caption:
+            print("ERROR: --run-pathway-d requires --inject-caption")
+            sys.exit(1)
+        if not (1 <= args.inject_at <= args.iters):
+            print(f"ERROR: --inject-at must be in [1, {args.iters}]")
+            sys.exit(1)
+        if args.inject_probe is None:
+            args.inject_probe = args.inject_caption
+    return args
 
 
 def authenticate_hf():
@@ -250,6 +272,48 @@ def run_pathway_c(img, pipe_controlnet, blip_processor, blip_model, args, out_di
     return images
 
 
+def run_pathway_d(img, pipe_txt2img, blip_processor, blip_model, args, out_dir, device):
+    """Pathway D: false memory injection.
+
+    Identical to Pathway B (caption→txt2img loop) except that at iteration
+    `args.inject_at` the BLIP caption is replaced with `args.inject_caption`.
+    Subsequent iterations resume normal BLIP captioning of the post-injection
+    image, so any persistence of the injected detail is a property of the
+    reconstruction process, not of repeated prompting.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    current = img.copy()
+    current.save(out_dir / "iter_00.png")
+    images = [current]
+    captions = []
+
+    for i in range(1, args.iters + 1):
+        if i == args.inject_at:
+            cap = args.inject_caption
+            captions.append(f"iter_{i:02d}: [INJECTED] {cap}")
+            print(f"  Pathway D  iter {i}/{args.iters}  [INJECTED]: {cap}")
+        else:
+            cap = caption_image(current, blip_processor, blip_model, device)
+            captions.append(f"iter_{i:02d}: {cap}")
+            print(f"  Pathway D  iter {i}/{args.iters}  caption: {cap}")
+
+        gen = torch.Generator(device=device).manual_seed(args.seed + i)
+        result = pipe_txt2img(
+            prompt=cap,
+            guidance_scale=args.guidance,
+            num_inference_steps=args.steps,
+            height=current.size[1],
+            width=current.size[0],
+            generator=gen,
+        ).images[0]
+        result.save(out_dir / f"iter_{i:02d}.png")
+        images.append(result)
+        current = result
+
+    (out_dir / "captions.txt").write_text("\n".join(captions) + "\n")
+    return images
+
+
 def make_grid(images, labels, save_path):
     """Horizontal concatenation of images with labels above each."""
     label_h = 24
@@ -322,6 +386,12 @@ def main():
             )
             make_grid(imgs_c, labels, dir_c / f"grid_c_{mode}.png")
 
+    if args.run_pathway_d:
+        dir_d = image_dir / "pathway_d"
+        print(f"Running Pathway D (false memory, inject at iter {args.inject_at})...")
+        imgs_d = run_pathway_d(img, pipe_txt2img, blip_proc, blip_model, args, dir_d, device)
+        make_grid(imgs_d, labels, dir_d / "grid_d.png")
+
     metadata = {
         "input": str(Path(args.input).resolve()),
         "image_name": image_name,
@@ -342,6 +412,12 @@ def main():
             "canny_low": args.canny_low,
             "canny_high": args.canny_high,
             "dream_structure": args.dream_structure,
+        })
+    if args.run_pathway_d:
+        metadata.update({
+            "inject_at": args.inject_at,
+            "inject_caption": args.inject_caption,
+            "inject_probe": args.inject_probe,
         })
     image_dir.mkdir(parents=True, exist_ok=True)
     (image_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
